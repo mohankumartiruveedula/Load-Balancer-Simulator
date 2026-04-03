@@ -4,10 +4,11 @@
  * Distributes incoming client connections across worker servers
  * using the Least-Connections algorithm.
  *
- * Worker list is configured at the top of main().
- * Default: 3 workers on ports 9001, 9002, 9003 (localhost).
+ * Workers are specified as command-line arguments in ip:port format.
+ * Any number of workers (up to MAX_WORKERS) can be supplied.
  *
- * Usage: load_balancer
+ * Usage: load_balancer <ip:port> [ip:port ...]
+ *   e.g. load_balancer 127.0.0.1:9001 127.0.0.1:9002 127.0.0.1:9003
  */
 
 #include "common.h"
@@ -219,11 +220,60 @@ static void handle_new_client(sock_t client_fd, struct sockaddr_in *client_addr)
 }
 
 /* ── Main ───────────────────────────────────────────────────────── */
-int main(void) {
+int main(int argc, char *argv[]) {
     sock_t server_fd;
     int opt = 1;
     int i;
     struct sockaddr_in addr;
+
+    /* ── Parse worker list from arguments ──────────────────────── */
+    if (argc < 2) {
+        fprintf(stderr,
+            "Usage: %s <ip:port> [ip:port ...]\n"
+            "  e.g. %s 127.0.0.1:9001 127.0.0.1:9002 127.0.0.1:9003\n",
+            argv[0], argv[0]);
+        return 1;
+    }
+
+    num_workers = 0;
+    for (i = 1; i < argc; i++) {
+        char *arg = argv[i];
+        char *colon;
+        int   port;
+
+        if (num_workers >= MAX_WORKERS) {
+            fprintf(stderr, "Warning: MAX_WORKERS (%d) reached, ignoring %s\n",
+                    MAX_WORKERS, arg);
+            break;
+        }
+
+        /* Find the last colon to split ip and port */
+        colon = strrchr(arg, ':');
+        if (!colon || colon == arg) {
+            fprintf(stderr, "Error: Invalid worker address '%s' (expected ip:port).\n", arg);
+            return 1;
+        }
+
+        port = atoi(colon + 1);
+        if (port <= 0 || port > 65535) {
+            fprintf(stderr, "Error: Invalid port in '%s'.\n", arg);
+            return 1;
+        }
+
+        /* Copy just the IP part */
+        int ip_len = (int)(colon - arg);
+        if (ip_len <= 0 || ip_len >= (int)sizeof(workers[num_workers].ip)) {
+            fprintf(stderr, "Error: Invalid IP in '%s'.\n", arg);
+            return 1;
+        }
+        strncpy(workers[num_workers].ip, arg, ip_len);
+        workers[num_workers].ip[ip_len] = '\0';
+
+        workers[num_workers].port         = port;
+        workers[num_workers].active_conns = 0;
+        workers[num_workers].total_served = 0;
+        num_workers++;
+    }
 
     if (sock_init() != 0) {
         fprintf(stderr, "Error: Socket initialization failed.\n");
@@ -231,24 +281,6 @@ int main(void) {
     }
 
     MUTEX_INIT(worker_mutex);
-
-    /* ── Configure workers ──────────────────────────────────────── */
-    num_workers = 3;
-
-    strcpy(workers[0].ip, "127.0.0.1");
-    workers[0].port         = 9001;
-    workers[0].active_conns = 0;
-    workers[0].total_served = 0;
-
-    strcpy(workers[1].ip, "127.0.0.1");
-    workers[1].port         = 9002;
-    workers[1].active_conns = 0;
-    workers[1].total_served = 0;
-
-    strcpy(workers[2].ip, "127.0.0.1");
-    workers[2].port         = 9003;
-    workers[2].active_conns = 0;
-    workers[2].total_served = 0;
 
     /* ── Create listening socket ────────────────────────────────── */
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
