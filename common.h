@@ -126,6 +126,8 @@ typedef struct {
     int    port;                     /* worker port                   */
     int    active_conns;             /* current active connections    */
     int    total_served;             /* lifetime connections served   */
+    int    is_alive;                 /* 1 = healthy, 0 = down         */
+    time_t dead_since;               /* time() when marked dead       */
 } worker_info_t;
 
 /* ── Utility ────────────────────────────────────────────────────── */
