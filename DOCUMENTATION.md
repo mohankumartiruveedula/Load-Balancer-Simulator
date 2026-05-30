@@ -58,6 +58,12 @@ The load balancer acts as a **transparent TCP proxy**. It does not interpret the
 - **Thread 1:** Client → Worker (forwards client requests)
 - **Thread 2:** Worker → Client (forwards worker responses)
 
+### 2.6 Fault Tolerance & Recovery
+
+The load balancer integrates robust fault tolerance mechanisms:
+- **Transparent Failover:** If a worker crashes mid-session, the load balancer intercepts the connection error and seamlessly re-routes the client to the next healthy worker. The client remains connected and simply receives a notice.
+- **Proactive Health Checks:** For workers marked 'DOWN', the load balancer natively periodically tests connections to see if they've come back online, restoring them automatically into the load balancing pool.
+
 ---
 
 ## 3. System Architecture
@@ -143,6 +149,12 @@ It also defines shared constants (buffer size, max workers, port numbers) and a 
 
 ### 5.3 load_balancer.c — Central Router
 
+**Startup:** The load balancer natively spins up worker servers internally via `spawn_workers()` by utilizing process creation APIs (`CreateProcess` or `fork/execl`). It initializes a predefined number of workers (`NUM_WORKER_PORTS`) running on incremental ports seamlessly in the background.
+
+```
+Usage: load_balancer.exe
+```
+
 **Core data structure:** A global `workers[]` array stores each worker's IP, port, active connections, and total served count, protected by a mutex.
 
 **Least-Connections selection (`select_worker`):**
@@ -179,14 +191,13 @@ gcc -Wall -O2 -o load_balancer.exe load_balancer.c -lws2_32
 gcc -Wall -O2 -o client.exe client.c -lws2_32
 ```
 
-### Run (5 terminals)
+### Run (2 terminals)
 ```
-Terminal 1:  worker_server.exe 9001
-Terminal 2:  worker_server.exe 9002
-Terminal 3:  worker_server.exe 9003
-Terminal 4:  load_balancer.exe
-Terminal 5:  client.exe
+Terminal 1:  load_balancer.exe
+Terminal 2:  client.exe
 ```
+
+> **Auto-Spawning Workers:** The Load Balancer natively spawns its own background `worker_server.exe` processes rather than needing them to be started manually. Upon execution, it dynamically sets up the port bindings for all configured workers.
 
 ### Example Session
 ```
@@ -209,6 +220,7 @@ This project demonstrates the fundamentals of:
 - **TCP socket programming** with multi-threaded connection handling
 - **Proxy design** with bidirectional data relay
 - **Distributed system architecture** with a central coordinator and worker pool
+- **Fault tolerance** through seamless failover and health checks
 - **Cross-platform C development** using abstraction layers
 
-The system is extensible — additional workers can be added by modifying the worker table in `load_balancer.c`, and new services can be added to the workers by implementing additional command handlers.
+The system leverages an automated worker spawning process, minimizing human setup. New services can easily be added to the proxy endpoints by implementing additional command handlers in `worker_server.c`.

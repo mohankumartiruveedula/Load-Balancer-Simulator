@@ -13,6 +13,8 @@
  */
 
 #include "common.h"
+#include <stdarg.h>
+#include <stdint.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -28,6 +30,318 @@ static worker_info_t workers[MAX_WORKERS];
 static int           num_workers = 0;
 static mutex_t       worker_mutex;
 
+/* ── Global dashboard & SSE configuration ────────────────────────── */
+static sock_t sse_clients[MAX_SSE_CLIENTS];
+static int    num_sse_clients = 0;
+static mutex_t sse_mutex;
+static char  *dashboard_html = NULL;
+static int    dashboard_html_len = 0;
+
+#ifdef _WIN32
+#define SEND_FLAGS 0
+#else
+#define SEND_FLAGS MSG_NOSIGNAL
+#endif
+
+static void load_dashboard_html(void) {
+    FILE *f = fopen("dashboard.html", "rb");
+    if (!f) {
+        LOG("LB", "WARNING: dashboard.html not found, using embedded minimal dashboard");
+        const char *fallback = "<html><head><title>Dashboard Error</title></head><body><h1>Dashboard HTML file not found!</h1><p>Place dashboard.html in execution directory.</p></body></html>";
+        dashboard_html = malloc(strlen(fallback) + 1);
+        if (dashboard_html) {
+            strcpy(dashboard_html, fallback);
+            dashboard_html_len = (int)strlen(fallback);
+        }
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    dashboard_html = malloc(size + 1);
+    if (dashboard_html) {
+        size_t read_bytes = fread(dashboard_html, 1, size, f);
+        dashboard_html[read_bytes] = '\0';
+        dashboard_html_len = (int)read_bytes;
+        LOG("LB", "Loaded dashboard.html (%d bytes)", (int)read_bytes);
+    }
+    fclose(f);
+}
+
+static void broadcast_sse(const char *event, const char *data) {
+    char buf[BUF_SIZE * 2];
+    int len;
+    if (event) {
+        len = snprintf(buf, sizeof(buf), "event: %s\ndata: %s\n\n", event, data);
+    } else {
+        len = snprintf(buf, sizeof(buf), "data: %s\n\n", data);
+    }
+
+    MUTEX_LOCK(sse_mutex);
+    for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
+        if (sse_clients[i] != INVALID_SOCK) {
+            int sent = send(sse_clients[i], buf, len, SEND_FLAGS);
+            if (sent <= 0) {
+                LOG("LB", "Removing disconnected SSE client %d", (int)sse_clients[i]);
+                CLOSE_SOCKET(sse_clients[i]);
+                sse_clients[i] = INVALID_SOCK;
+                if (num_sse_clients > 0) num_sse_clients--;
+            }
+        }
+    }
+    MUTEX_UNLOCK(sse_mutex);
+}
+
+static void broadcast_state(void) {
+    worker_info_t local_workers[MAX_WORKERS];
+    int local_num_workers = 0;
+    int total_served = 0;
+    int active_sessions = 0;
+
+    MUTEX_LOCK(worker_mutex);
+    local_num_workers = num_workers;
+    for (int i = 0; i < num_workers; i++) {
+        local_workers[i] = workers[i];
+    }
+    MUTEX_UNLOCK(worker_mutex);
+
+    char json[2048];
+    int offset = 0;
+    offset += snprintf(json + offset, sizeof(json) - offset, "{\"workers\":[");
+    for (int i = 0; i < local_num_workers; i++) {
+        offset += snprintf(json + offset, sizeof(json) - offset,
+            "%s{\"id\":%d,\"ip\":\"%s\",\"port\":%d,\"active_conns\":%d,\"total_served\":%d,\"is_alive\":%d}",
+            (i > 0 ? "," : ""),
+            i, local_workers[i].ip, local_workers[i].port,
+            local_workers[i].active_conns, local_workers[i].total_served,
+            local_workers[i].is_alive);
+        total_served += local_workers[i].total_served;
+        active_sessions += local_workers[i].active_conns;
+    }
+    offset += snprintf(json + offset, sizeof(json) - offset, "],\"total_served\":%d,\"active_sessions\":%d}",
+                        total_served, active_sessions);
+
+    broadcast_sse("state", json);
+}
+
+static void broadcast_log(const char *tag, const char *fmt, ...) {
+    char message[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+
+    time_t t = time(NULL);
+    struct tm *tm_info = localtime(&t);
+    char ts[20];
+    strftime(ts, sizeof(ts), "%H:%M:%S", tm_info);
+
+    char escaped_msg[2048];
+    int j = 0;
+    for (int i = 0; message[i] != '\0' && j < (int)sizeof(escaped_msg) - 2; i++) {
+        if (message[i] == '"' || message[i] == '\\') {
+            escaped_msg[j++] = '\\';
+        }
+        escaped_msg[j++] = message[i];
+    }
+    escaped_msg[j] = '\0';
+
+    char json[3000];
+    snprintf(json, sizeof(json), "{\"timestamp\":\"%s\",\"tag\":\"%s\",\"message\":\"%s\"}",
+             ts, tag, escaped_msg);
+    
+    broadcast_sse("log", json);
+}
+
+static void handle_http_request(sock_t client_fd) {
+    char buf[2048];
+    int received = recv(client_fd, buf, sizeof(buf) - 1, 0);
+    if (received <= 0) {
+        CLOSE_SOCKET(client_fd);
+        return;
+    }
+    buf[received] = '\0';
+
+    char method[16] = {0};
+    char path[256] = {0};
+    if (sscanf(buf, "%15s %255s", method, path) < 2) {
+        CLOSE_SOCKET(client_fd);
+        return;
+    }
+
+    if (strcmp(method, "GET") == 0) {
+        if (strcmp(path, "/") == 0) {
+            char headers[512];
+            int len = snprintf(headers, sizeof(headers),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/html\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n\r\n",
+                dashboard_html_len);
+            send(client_fd, headers, len, 0);
+            send(client_fd, dashboard_html, dashboard_html_len, 0);
+            CLOSE_SOCKET(client_fd);
+        }
+        else if (strcmp(path, "/events") == 0) {
+            const char *headers =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: keep-alive\r\n"
+                "Access-Control-Allow-Origin: *\r\n\r\n";
+            send(client_fd, headers, (int)strlen(headers), 0);
+
+            MUTEX_LOCK(sse_mutex);
+            int added = 0;
+            for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
+                if (sse_clients[i] == INVALID_SOCK) {
+                    sse_clients[i] = client_fd;
+                    num_sse_clients++;
+                    added = 1;
+                    break;
+                }
+            }
+            MUTEX_UNLOCK(sse_mutex);
+
+            if (!added) {
+                LOG("LB", "WARNING: Max SSE clients reached. Rejecting client.");
+                CLOSE_SOCKET(client_fd);
+            } else {
+                LOG("LB", "New SSE subscriber from client fd %d (total: %d)", (int)client_fd, num_sse_clients);
+                broadcast_state();
+            }
+        }
+        else if (strcmp(path, "/api/status") == 0) {
+            worker_info_t local_workers[MAX_WORKERS];
+            int local_num_workers = 0;
+            int total_served = 0;
+            int active_sessions = 0;
+
+            MUTEX_LOCK(worker_mutex);
+            local_num_workers = num_workers;
+            for (int i = 0; i < num_workers; i++) {
+                local_workers[i] = workers[i];
+            }
+            MUTEX_UNLOCK(worker_mutex);
+
+            char json[2048];
+            int offset = 0;
+            offset += snprintf(json + offset, sizeof(json) - offset, "{\"workers\":[");
+            for (int i = 0; i < local_num_workers; i++) {
+                offset += snprintf(json + offset, sizeof(json) - offset,
+                    "%s{\"id\":%d,\"ip\":\"%s\",\"port\":%d,\"active_conns\":%d,\"total_served\":%d,\"is_alive\":%d}",
+                    (i > 0 ? "," : ""),
+                    i, local_workers[i].ip, local_workers[i].port,
+                    local_workers[i].active_conns, local_workers[i].total_served,
+                    local_workers[i].is_alive);
+                total_served += local_workers[i].total_served;
+                active_sessions += local_workers[i].active_conns;
+            }
+            offset += snprintf(json + offset, sizeof(json) - offset, "],\"total_served\":%d,\"active_sessions\":%d}",
+                                total_served, active_sessions);
+
+            char headers[512];
+            int len = snprintf(headers, sizeof(headers),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n"
+                "Access-Control-Allow-Origin: *\r\n\r\n",
+                (int)strlen(json));
+            send(client_fd, headers, len, 0);
+            send(client_fd, json, (int)strlen(json), 0);
+            CLOSE_SOCKET(client_fd);
+        }
+        else {
+            const char *res = 
+                "HTTP/1.1 404 Not Found\r\n"
+                "Content-Length: 9\r\n"
+                "Connection: close\r\n\r\n"
+                "Not Found";
+            send(client_fd, res, (int)strlen(res), 0);
+            CLOSE_SOCKET(client_fd);
+        }
+    } else {
+        const char *res = 
+            "HTTP/1.1 405 Method Not Allowed\r\n"
+            "Content-Length: 18\r\n"
+            "Connection: close\r\n\r\n"
+            "Method Not Allowed";
+        send(client_fd, res, (int)strlen(res), 0);
+        CLOSE_SOCKET(client_fd);
+    }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI http_client_handler(LPVOID arg) {
+#else
+static void *http_client_handler(void *arg) {
+#endif
+    sock_t client_fd = (sock_t)(uintptr_t)arg;
+    handle_http_request(client_fd);
+    return 0;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI http_server_thread(LPVOID arg) {
+#else
+static void *http_server_thread(void *arg) {
+#endif
+    (void)arg;
+    sock_t server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == INVALID_SOCK) {
+        LOG("LB-HTTP", "ERROR: Could not create socket (%d)", sock_errno());
+        return 0;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(DASHBOARD_PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) == SOCK_ERR) {
+        LOG("LB-HTTP", "ERROR: bind failed on port %d (%d)", DASHBOARD_PORT, sock_errno());
+        CLOSE_SOCKET(server_fd);
+        return 0;
+    }
+
+    if (listen(server_fd, 10) == SOCK_ERR) {
+        LOG("LB-HTTP", "ERROR: listen failed (%d)", sock_errno());
+        CLOSE_SOCKET(server_fd);
+        return 0;
+    }
+
+    LOG("LB", "Dashboard HTTP server listening on port %d", DASHBOARD_PORT);
+
+    for (;;) {
+        struct sockaddr_in client_addr;
+        int addrlen = sizeof(client_addr);
+        sock_t client_fd;
+#ifdef _WIN32
+        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
+#else
+        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &(unsigned int)addrlen);
+#endif
+        if (client_fd == INVALID_SOCK) {
+            continue;
+        }
+
+        thread_t t;
+        if (thread_create(&t, http_client_handler, (void *)(uintptr_t)client_fd) != 0) {
+            CLOSE_SOCKET(client_fd);
+        } else {
+            thread_detach(t);
+        }
+    }
+
+    CLOSE_SOCKET(server_fd);
+    return 0;
+}
+
 /* ── Select worker with least connections ───────────────────────── */
 /*  Pass 1: prefer alive workers (least-connections).                  */
 /*  Pass 2: if none alive, retry dead workers past WORKER_RETRY_SECS   */
@@ -38,12 +352,15 @@ static mutex_t       worker_mutex;
 static int select_worker(void) {
     int    best = -1, i;
     time_t now  = time(NULL);
+    int    healed_indices[MAX_WORKERS];
+    int    healed_count = 0;
+    int    retried_idx = -1;
+
     MUTEX_LOCK(worker_mutex);
 
     /* Pass 0: heal DOWN workers that are now reachable */
     for (i = 0; i < num_workers; i++) {
         if (workers[i].is_alive) continue;
-        /* Try a quick connect to see if the worker came back */
         sock_t probe = socket(AF_INET, SOCK_STREAM, 0);
         if (probe != INVALID_SOCK) {
             struct sockaddr_in a;
@@ -55,8 +372,7 @@ static int select_worker(void) {
                 CLOSE_SOCKET(probe);
                 workers[i].is_alive  = 1;
                 workers[i].dead_since = 0;
-                LOG("LB", "Worker %s:%d is back ALIVE (proactive check)",
-                    workers[i].ip, workers[i].port);
+                healed_indices[healed_count++] = i;
             } else {
                 CLOSE_SOCKET(probe);
             }
@@ -76,8 +392,7 @@ static int select_worker(void) {
             if (workers[i].is_alive) continue;
             if (now - workers[i].dead_since >= WORKER_RETRY_SECS) {
                 workers[i].is_alive = 1; /* tentative: confirmed by connect */
-                LOG("LB", "Retrying previously-dead worker %s:%d",
-                    workers[i].ip, workers[i].port);
+                retried_idx = i;
                 best = i;
                 break;
             }
@@ -89,6 +404,24 @@ static int select_worker(void) {
         workers[best].total_served++;
     }
     MUTEX_UNLOCK(worker_mutex);
+
+    /* Perform all logging and broadcasting outside the critical section */
+    for (i = 0; i < healed_count; i++) {
+        int idx = healed_indices[i];
+        LOG("LB", "Worker %s:%d is back ALIVE (proactive check)",
+            workers[idx].ip, workers[idx].port);
+        broadcast_log("LB", "Worker %s:%d is back ALIVE (proactive check)",
+                      workers[idx].ip, workers[idx].port);
+    }
+
+    if (retried_idx >= 0) {
+        LOG("LB", "Retrying previously-dead worker %s:%d",
+            workers[retried_idx].ip, workers[retried_idx].port);
+        broadcast_log("LB", "Retrying previously-dead worker %s:%d",
+                      workers[retried_idx].ip, workers[retried_idx].port);
+    }
+
+    broadcast_state();
     return best;
 }
 
@@ -98,6 +431,7 @@ static void release_worker(int idx) {
     if (workers[idx].active_conns > 0)
         workers[idx].active_conns--;
     MUTEX_UNLOCK(worker_mutex);
+    broadcast_state();
 }
 
 /* ── Mark a worker as dead, record timestamp ────────────────── */
@@ -105,17 +439,25 @@ static void release_worker(int idx) {
 /* always decrement active_conns (not guarded by is_alive), and only   */
 /* log + record dead_since the first time is_alive flips.              */
 static void mark_worker_dead(int idx) {
+    int marked_dead = 0;
     MUTEX_LOCK(worker_mutex);
     if (workers[idx].is_alive) {
         workers[idx].is_alive  = 0;
         workers[idx].dead_since = time(NULL);
-        LOG("LB", "Worker %s:%d marked as DOWN",
-            workers[idx].ip, workers[idx].port);
+        marked_dead = 1;
     }
     /* Always decrement so every failing session releases its slot */
     if (workers[idx].active_conns > 0)
         workers[idx].active_conns--;
     MUTEX_UNLOCK(worker_mutex);
+
+    if (marked_dead) {
+        LOG("LB", "Worker %s:%d marked as DOWN",
+            workers[idx].ip, workers[idx].port);
+        broadcast_log("LB", "Worker %s:%d marked as DOWN",
+                      workers[idx].ip, workers[idx].port);
+    }
+    broadcast_state();
 }
 
 /* ── Print worker status dashboard ──────────────────────────────── */
@@ -134,6 +476,7 @@ static void print_dashboard(void) {
     printf("+-----+-------------------+--------+--------+\n\n");
     fflush(stdout);
     MUTEX_UNLOCK(worker_mutex);
+    broadcast_state();
 }
 
 /* ── Connect to a worker server ─────────────────────────────────── */
@@ -142,6 +485,7 @@ static void print_dashboard(void) {
 static sock_t connect_to_worker(int idx) {
     sock_t fd;
     struct sockaddr_in addr;
+    int restored = 0;
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == INVALID_SOCK) return INVALID_SOCK;
@@ -163,10 +507,17 @@ static sock_t connect_to_worker(int idx) {
     MUTEX_LOCK(worker_mutex);
     if (!workers[idx].is_alive) {
         workers[idx].is_alive = 1;
-        LOG("LB", "Worker %s:%d is back ALIVE",
-            workers[idx].ip, workers[idx].port);
+        restored = 1;
     }
     MUTEX_UNLOCK(worker_mutex);
+
+    if (restored) {
+        LOG("LB", "Worker %s:%d is back ALIVE",
+            workers[idx].ip, workers[idx].port);
+        broadcast_log("LB", "Worker %s:%d is back ALIVE",
+                      workers[idx].ip, workers[idx].port);
+    }
+    broadcast_state();
 
     return fd;
 }
@@ -229,7 +580,7 @@ static void *relay_session(void *arg) {
         if (FD_ISSET(client_fd, &readfds)) {
             n = recv(client_fd, buf, sizeof(buf), 0);
             if (n <= 0) goto session_end;          /* client disconnected  */
-            if (send(worker_fd, buf, n, 0) <= 0)
+            if (send(worker_fd, buf, n, SEND_FLAGS) <= 0)
                 goto worker_failed;                /* worker write error   */
         }
 
@@ -238,7 +589,7 @@ static void *relay_session(void *arg) {
             n = recv(worker_fd, buf, sizeof(buf), 0);
             if (n < 0)  goto worker_failed;        /* worker error / crash */
             if (n == 0) goto session_end;          /* clean QUIT close     */
-            if (send(client_fd, buf, n, 0) <= 0) goto session_end;
+            if (send(client_fd, buf, n, SEND_FLAGS) <= 0) goto session_end;
         }
         continue;
 
@@ -251,11 +602,13 @@ static void *relay_session(void *arg) {
             mark_worker_dead(worker_idx);
             LOG("LB", "Worker %s:%d failed – attempting failover",
                 workers[worker_idx].ip, workers[worker_idx].port);
+            broadcast_log("LB", "Worker %s:%d failed – attempting failover",
+                          workers[worker_idx].ip, workers[worker_idx].port);
 
             new_idx = select_worker();
             if (new_idx < 0) {
                 const char *err = "\n[LB] All servers are down. Disconnecting.\n";
-                send(client_fd, err, (int)strlen(err), 0);
+                send(client_fd, err, (int)strlen(err), SEND_FLAGS);
                 goto session_end;
             }
 
@@ -263,7 +616,7 @@ static void *relay_session(void *arg) {
             if (new_wfd == INVALID_SOCK) {
                 release_worker(new_idx);
                 const char *err = "\n[LB] Failover failed. Disconnecting.\n";
-                send(client_fd, err, (int)strlen(err), 0);
+                send(client_fd, err, (int)strlen(err), SEND_FLAGS);
                 goto session_end;
             }
 
@@ -271,11 +624,13 @@ static void *relay_session(void *arg) {
             {
                 const char *notice =
                     "\n[LB] Server failed. Reconnecting to another server...\n";
-                send(client_fd, notice, (int)strlen(notice), 0);
+                send(client_fd, notice, (int)strlen(notice), SEND_FLAGS);
             }
 
             LOG("LB", "Failover successful -> Worker %s:%d",
                 workers[new_idx].ip, workers[new_idx].port);
+            broadcast_log("LB", "Failover successful -> Worker %s:%d",
+                          workers[new_idx].ip, workers[new_idx].port);
 
             worker_fd  = new_wfd;
             worker_idx = new_idx;
@@ -290,6 +645,8 @@ session_end:
     release_worker(worker_idx);
     LOG("LB", "Session ended (worker %s:%d)",
         workers[worker_idx].ip, workers[worker_idx].port);
+    broadcast_log("LB", "Session ended (worker %s:%d)",
+                  workers[worker_idx].ip, workers[worker_idx].port);
     print_dashboard();
     return 0;
 }
@@ -308,11 +665,12 @@ static void handle_new_client(sock_t client_fd,
     client_port = ntohs(client_addr->sin_port);
 
     LOG("LB", "New connection from %s:%d", client_ip, client_port);
+    broadcast_log("LB", "New connection from %s:%d", client_ip, client_port);
 
     idx = select_worker();
     if (idx < 0) {
         const char *msg = "ERROR: No workers available.\n";
-        send(client_fd, msg, (int)strlen(msg), 0);
+        send(client_fd, msg, (int)strlen(msg), SEND_FLAGS);
         CLOSE_SOCKET(client_fd);
         return;
     }
@@ -321,19 +679,37 @@ static void handle_new_client(sock_t client_fd,
         client_ip, client_port,
         workers[idx].ip, workers[idx].port,
         workers[idx].active_conns);
+    broadcast_log("LB", "Routing %s:%d -> Worker %s:%d  (active: %d)",
+                  client_ip, client_port,
+                  workers[idx].ip, workers[idx].port,
+                  workers[idx].active_conns);
 
     worker_fd = connect_to_worker(idx);
     if (worker_fd == INVALID_SOCK) {
         LOG("LB", "Cannot connect to worker %s:%d – marking DOWN",
             workers[idx].ip, workers[idx].port);
+        broadcast_log("LB", "Cannot connect to worker %s:%d – marking DOWN",
+                      workers[idx].ip, workers[idx].port);
         mark_worker_dead(idx);
         /* Immediately try another worker */
         idx = select_worker();
-        if (idx >= 0) worker_fd = connect_to_worker(idx);
+        if (idx >= 0) {
+            worker_fd = connect_to_worker(idx);
+            if (worker_fd != INVALID_SOCK) {
+                LOG("LB", "Routing %s:%d -> Worker %s:%d  (active: %d)",
+                    client_ip, client_port,
+                    workers[idx].ip, workers[idx].port,
+                    workers[idx].active_conns);
+                broadcast_log("LB", "Routing %s:%d -> Worker %s:%d  (active: %d)",
+                              client_ip, client_port,
+                              workers[idx].ip, workers[idx].port,
+                              workers[idx].active_conns);
+            }
+        }
         if (idx < 0 || worker_fd == INVALID_SOCK) {
             if (idx >= 0) release_worker(idx);
             const char *msg = "ERROR: No workers available.\n";
-            send(client_fd, msg, (int)strlen(msg), 0);
+            send(client_fd, msg, (int)strlen(msg), SEND_FLAGS);
             CLOSE_SOCKET(client_fd);
             return;
         }
@@ -354,6 +730,7 @@ static void handle_new_client(sock_t client_fd,
 
     if (thread_create(&t, relay_session, ctx) != 0) {
         LOG("LB", "ERROR: Thread creation failed.");
+        broadcast_log("LB", "ERROR: Thread creation failed.");
         free(ctx);
         CLOSE_SOCKET(client_fd);
         CLOSE_SOCKET(worker_fd);
@@ -368,6 +745,7 @@ static void spawn_workers(void) {
     int i;
     for (i = 0; i < NUM_WORKER_PORTS; i++) {
         char cmd[256];
+        int port = BASE_WORKER_PORT + i;
 #ifdef _WIN32
         STARTUPINFO si;
         PROCESS_INFORMATION pi;
@@ -375,7 +753,6 @@ static void spawn_workers(void) {
         si.cb = sizeof(si);
         ZeroMemory(&pi, sizeof(pi));
 
-        int port = BASE_WORKER_PORT + i;
         snprintf(cmd, sizeof(cmd), "worker_server.exe %d", port);
         if (CreateProcess(NULL, cmd, NULL, NULL, FALSE,
                           CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
@@ -420,6 +797,24 @@ int main(void) {
     }
 
     MUTEX_INIT(worker_mutex);
+    MUTEX_INIT(sse_mutex);
+
+    for (i = 0; i < MAX_SSE_CLIENTS; i++) {
+        sse_clients[i] = INVALID_SOCK;
+    }
+    num_sse_clients = 0;
+
+    load_dashboard_html();
+
+    /* Start HTTP Server Thread for Dashboard */
+    {
+        thread_t http_server_tid;
+        if (thread_create(&http_server_tid, http_server_thread, NULL) != 0) {
+            fprintf(stderr, "Error: Failed to start HTTP server thread.\n");
+        } else {
+            thread_detach(http_server_tid);
+        }
+    }
 
     num_workers = 0;
     for (i = 0; i < NUM_WORKER_PORTS; i++) {
@@ -479,9 +874,16 @@ int main(void) {
     for (;;) {
         struct sockaddr_in client_addr;
         int    addrlen  = sizeof(client_addr);
-        sock_t client_fd = accept(server_fd,
-                                  (struct sockaddr *)&client_addr,
-                                  &addrlen);
+        sock_t client_fd;
+        #ifdef _WIN32 
+            client_fd = accept(server_fd,
+                                    (struct sockaddr *)&client_addr,
+                                    &addrlen);
+        #else
+                client_fd = accept(server_fd,
+                                    (struct sockaddr *)&client_addr,
+                                    &(unsigned int)addrlen);
+        #endif
         if (client_fd == INVALID_SOCK) {
             LOG("LB", "accept() failed (%d), continuing...", sock_errno());
             continue;
@@ -490,6 +892,10 @@ int main(void) {
     }
 
     MUTEX_DESTROY(worker_mutex);
+    MUTEX_DESTROY(sse_mutex);
+    if (dashboard_html) {
+        free(dashboard_html);
+    }
     CLOSE_SOCKET(server_fd);
     sock_cleanup();
     return 0;

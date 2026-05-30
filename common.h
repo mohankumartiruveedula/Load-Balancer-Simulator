@@ -119,6 +119,8 @@
 #define MAX_WORKERS      10          /* Maximum backend workers       */
 #define BUF_SIZE         4096        /* I/O buffer size               */
 #define MAX_PENDING      64          /* listen() backlog              */
+#define DASHBOARD_PORT   8081        /* Dashboard HTTP/SSE port       */
+#define MAX_SSE_CLIENTS  16          /* Max concurrent browser tabs   */
 
 /* ── Worker descriptor ──────────────────────────────────────────── */
 typedef struct {

@@ -52,7 +52,7 @@ Unlike simple round-robin implementations, this system features **transparent mi
 | 💓 **Proactive Health Checks** | Periodically probes downed workers and automatically restores them when they come back online |
 | 🚀 **Auto Worker Spawning** | Load balancer automatically launches configured number of worker processes on startup |
 | 🧵 **Multi-Threaded Proxy** | Uses `select()`-based I/O multiplexing per session for efficient bidirectional data relay |
-| 📊 **Live Dashboard** | Real-time ASCII dashboard showing worker status, active connections, and health state |
+| 📊 **Real-Time Web Dashboard** | Glassmorphic web UI (`http://localhost:8081`) streaming worker health, connection bars, and log timelines in real-time via Server-Sent Events (SSE) |
 | 🖥️ **Cross-Platform** | Compiles and runs on both Windows (Winsock2) and Linux (POSIX sockets) with zero code changes |
 
 ---
@@ -116,6 +116,22 @@ Notify client: "[LB] Server failed. Reconnecting..."
       ▼
 Resume relay loop with new worker_fd  ✓ Client never disconnects
 ```
+
+---
+
+## 📊 Real-Time Web Dashboard
+
+In addition to the terminal-based output, the load balancer runs an embedded HTTP server on **port 8081** which serves a modern, responsive web dashboard.
+
+- **Real-Time Data Streaming**: Uses **Server-Sent Events (SSE)** (`EventSource` API) to push events instantly from the C backend to the browser.
+- **Glassmorphism UI**: Features a dark theme with glass-like panels, worker status cards, dynamic connection progress bars, and stats widgets.
+- **Live Logs Timeline**: A scrolling terminal console in the web UI that displays real-time connection routing, failovers, and worker recoveries.
+- **API Access**: Exposes `GET /api/status` returning a JSON snapshot of the cluster state.
+
+To access the dashboard:
+1. Open your browser and navigate to `http://localhost:8081`.
+2. Connect clients and watch the routing and connection bars update in real-time.
+3. Terminate a worker process to watch its card turn red (DOWN) and log the failover instantly.
 
 ---
 
